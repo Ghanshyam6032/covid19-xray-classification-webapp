@@ -6,7 +6,7 @@ import numpy as np
 import tensorflow as tf
 import io
 import os
-import gdown
+import requests
 
 app = FastAPI(
     title="COVID-19 Chest X-Ray Classification API",
@@ -31,19 +31,26 @@ app.add_middleware(
 
 MODEL_PATH = "covid_mobilenetv2.h5"
 
+MODEL_URL = (
+    "https://huggingface.co/Ghanshyam51/"
+    "covid19-mobilenetv2-model/"
+    "resolve/main/covid_mobilenetv2.h5"
+)
+
 if not os.path.exists(MODEL_PATH):
 
-    print("Downloading model from Google Drive...")
+    print("Downloading model from Hugging Face...")
 
-    file_id = "1IK0h4X6vfrL-uQtGqffnk7xqU2mfK6oT"
+    response = requests.get(MODEL_URL, stream=True)
 
-    url = f"https://drive.google.com/uc?id={file_id}"
+    response.raise_for_status()
 
-    gdown.download(
-        url,
-        MODEL_PATH,
-        quiet=False
-    )
+    with open(MODEL_PATH, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    print("Model downloaded successfully!")
 
 print("Loading model...")
 
@@ -84,18 +91,14 @@ async def predict(file: UploadFile = File(...)):
 
     contents = await file.read()
 
-    image = Image.open(
-        io.BytesIO(contents)
-    ).convert("RGB")
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
 
     image = image.resize(TARGET_SIZE)
 
     img_array = np.array(
         image,
         dtype=np.float32
-    )
-
-    img_array = img_array / 255.0
+    ) / 255.0
 
     img_array = np.expand_dims(
         img_array,
