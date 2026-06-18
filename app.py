@@ -9,7 +9,7 @@ import plotly.express as px
 # CONFIG
 # ======================
 
-FASTAPI_ENDPOINT = "https://render.com/docs/troubleshooting-deploys"
+FASTAPI_ENDPOINT = "https://covid19-xray-classification-webapp.onrender.com/"
 
 st.set_page_config(
     page_title="COVID-19 AI Detector",
