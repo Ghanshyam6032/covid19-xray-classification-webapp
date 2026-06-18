@@ -4,4 +4,4 @@ tensorflow==2.19.0
 numpy
 pillow
 python-multipart
-gdown
+requests
