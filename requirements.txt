@@ -1,12 +1,7 @@
-tensorflow==2.19.0
 fastapi
 uvicorn
-tensorflow
+tensorflow==2.19.0
 numpy
 pillow
 python-multipart
 gdown
-streamlit
-requests
-pandas
-plotly
