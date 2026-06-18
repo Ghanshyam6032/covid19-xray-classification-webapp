@@ -1,7 +1,5 @@
-fastapi
-uvicorn
-tensorflow==2.19.0
-numpy
+streamlit
+requests
+pandas
+plotly
 pillow
-python-multipart
-gdown
