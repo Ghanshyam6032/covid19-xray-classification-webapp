@@ -12,15 +12,15 @@ The project uses a MobileNetV2 Deep Learning model trained on Chest X-Ray images
 
 ### Frontend
 
-https://YOUR-FRONTEND-URL.onrender.com
+[https://YOUR-FRONTEND-URL.onrender.com](https://covid19-xray-frontend.onrender.com)
 
 ### Backend API
 
-https://YOUR-BACKEND-URL.onrender.com
+[https://YOUR-BACKEND-URL.onrender.com](https://covid19-xray-classification-webapp.onrender.com)
 
 ### API Documentation
 
-https://YOUR-BACKEND-URL.onrender.com/docs
+[https://YOUR-BACKEND-URL.onrender.com/docs](https://covid19-xray-frontend.onrender.com/docs)
 
 ---
 
