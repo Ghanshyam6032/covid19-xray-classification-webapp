@@ -255,7 +255,9 @@
     <div id="toast-box"></div>
 
     <script>
-        const API_BASE = "https://covid19-xray-api.onrender.com";
+        // Yahan rakhna hai aapka Modal Backend Link:
+        const API_BASE = "https://ghanshyam6032--neuroscan-covid-xray-fastapi-app.us-east.modal.run";
+        
         let activeFile = null;
         let currentPredId = null;
 
@@ -349,7 +351,7 @@
                 
                 renderResults(data);
                 showToast("Analysis Complete", "success");
-                fetchStats(); // Update dashboard
+                fetchStats();
             } catch(e) {
                 showToast(e.message, "error");
             } finally {
@@ -368,24 +370,30 @@
             const color = isCovid ? "var(--danger)" : "var(--success)";
             const bgColor = isCovid ? "var(--danger-bg)" : "var(--success-bg)";
 
+            const confPercent = data.confidence <= 1.0 ? data.confidence * 100 : data.confidence;
+            const latencyVal = data.latency_ms !== undefined ? data.latency_ms : data.inference_time_ms;
+
             // Badge & Meta
             const badge = document.getElementById('riskBadge');
             badge.textContent = isCovid ? "DETECTED: COVID-19" : "NORMAL / NO COVID";
             badge.style.background = bgColor; badge.style.color = color;
-            document.getElementById('metaData').textContent = `Latency: ${data.latency_ms}ms | ID: ${data.id.split('-')[0].toUpperCase()}`;
+            document.getElementById('metaData').textContent = `Latency: ${latencyVal}ms | ID: ${data.id.split('-')[0].toUpperCase()}`;
 
             // Circular Progress
             const circle = document.getElementById('circleProg');
             const confText = document.getElementById('confText');
             circle.style.stroke = color;
             confText.style.color = color;
-            confText.textContent = `${Math.round(data.confidence)}%`;
-            setTimeout(() => { circle.style.strokeDashoffset = 440 - (440 * data.confidence) / 100; }, 100);
+            confText.textContent = `${Math.round(confPercent)}%`;
+            setTimeout(() => { circle.style.strokeDashoffset = 440 - (440 * confPercent) / 100; }, 100);
 
             // Bar Charts
             const probCon = document.getElementById('probContainer');
             probCon.innerHTML = '';
-            for(const [cls, val] of Object.entries(data.probabilities)) {
+            for(const [cls, rawVal] of Object.entries(data.probabilities)) {
+                const val = rawVal <= 1.0 && Object.values(data.probabilities).every(v => v <= 1.0)
+                    ? Number((rawVal * 100).toFixed(2))
+                    : Number(Number(rawVal).toFixed(2));
                 const isMax = cls === data.prediction;
                 probCon.insertAdjacentHTML('beforeend', `
                     <div class="prob-item">
@@ -404,53 +412,57 @@
         }
 
         // PDF Report API Call
-async function generateReport() {
-    if(!currentPredId) return;
-    const pName = document.getElementById('pName').value || "Unknown";
-    const pAge = document.getElementById('pAge').value || "N/A";
-    const pGender = document.getElementById('pGender').value || "N/A";
-    const dName = document.getElementById('dName').value || "Assigned Physician";
-    
-    const btn = document.getElementById('pdfBtn');
-    btn.disabled = true; btn.textContent = "Compiling Report...";
+        async function generateReport() {
+            if(!currentPredId) return;
+            const pName = document.getElementById('pName').value || "Unknown";
+            const pAge = document.getElementById('pAge').value || "N/A";
+            const pGender = document.getElementById('pGender').value || "N/A";
+            const dName = document.getElementById('dName').value || "Assigned Physician";
+            
+            const btn = document.getElementById('pdfBtn');
+            btn.disabled = true; btn.textContent = "Compiling Report...";
 
-    try {
-        const req = await fetch(`${API_BASE}/generate-report`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ prediction_id: currentPredId, patient_name: pName, patient_age: pAge, patient_gender: pGender, doctor_name: dName })
-        });
-        
-        const data = await req.json();
-        if(!req.ok) throw new Error(data.detail);
+            try {
+                const req = await fetch(`${API_BASE}/generate-report`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        prediction_id: currentPredId,
+                        patient_name: pName,
+                        patient_age: String(pAge),
+                        patient_gender: pGender,
+                        doctor_name: dName
+                    })
+                });
+                
+                const data = await req.json();
+                if(!req.ok) throw new Error(data.detail || "Failed to generate report");
 
-        // 🚀 Naya Tarika: Invisible Link se download trigger karna
-        const downloadUrl = `${API_BASE}/download-report/${data.report_id}`;
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        
-        // Naya tab open karne ke bajaye seedha download force karega
-        a.setAttribute('download', ''); 
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+                const downloadUrl = `${API_BASE}/download-report/${data.report_id}`;
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.setAttribute('download', ''); 
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
 
-        showToast("Report Downloaded Successfully", "success");
-    } catch(e) {
-        showToast(e.message, "error");
-    } finally {
-        btn.disabled = false; btn.textContent = "Download PDF Report";
-    }
-}
+                showToast("Report Downloaded Successfully", "success");
+            } catch(e) {
+                showToast(e.message, "error");
+            } finally {
+                btn.disabled = false; btn.textContent = "Download PDF Report";
+            }
+        }
 
         // Stats Polling
         async function fetchStats() {
             try {
                 const res = await fetch(`${API_BASE}/statistics`);
                 const data = await res.json();
-                document.getElementById('statTotal').textContent = data.total_predictions.toLocaleString();
-                document.getElementById('statConf').textContent = `${data.average_confidence.toFixed(1)}%`;
-                document.getElementById('statLat').textContent = `${data.average_latency_ms.toFixed(0)} ms`;
+                const avgLat = data.average_latency_ms !== undefined ? data.average_latency_ms : (data.average_inference_time_ms || 0);
+                document.getElementById('statTotal').textContent = (data.total_predictions || 0).toLocaleString();
+                document.getElementById('statConf').textContent = `${(data.average_confidence || 0).toFixed(1)}%`;
+                document.getElementById('statLat').textContent = `${ avgLat.toFixed(0) } ms`;
             } catch(e) {}
         }
 

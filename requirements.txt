@@ -1,15 +1,9 @@
-# Web Framework & Server
-fastapi==0.110.0
-uvicorn==0.27.1
-python-multipart==0.0.9
-pydantic==2.6.4
-
-# Machine Learning & Data Processing
-tensorflow==2.15.0
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.19
+tensorflow-cpu==2.15.0
 numpy==1.26.4
-Pillow==10.2.0
-
-# PDF Report Generation
-fpdf2==2.7.7
-matplotlib==3.8.3
-qrcode==7.4.2
+pillow==11.0.0
+reportlab==4.2.5
+pydantic==2.10.3
+modal>=1.0.0

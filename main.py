@@ -1,374 +1,673 @@
-# ==============================================================================
-# NEUROSCAN AI - COVID-19 CHEST X-RAY CLASSIFICATION API
-# Enterprise FastAPI Backend with PDF Report Generation
-# ==============================================================================
-
-import os
 import io
+import os
 import time
 import uuid
 import logging
-import tempfile
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, BackgroundTasks
-from fastapi.responses import JSONResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from PIL import Image, UnidentifiedImageError
+import modal
 import numpy as np
-import tensorflow as tf
+from PIL import Image, ImageOps
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
-from fpdf import FPDF
-import matplotlib.pyplot as plt
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("neuroscan-covid-xray")
 
-# ==============================================================================
-# CONFIGURATION & LOGGING
-# ==============================================================================
+# ---------------------------------------------------------------------------
+# Paths & Constants (Pure Backend - Only Model & Labels)
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+CONTAINER_DIR = Path("/app")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("NeuroScanAPI")
-
-MODEL_PATH = "keras_model.h5"
-LABELS_PATH = "labels.txt"
-TARGET_SIZE = (224, 224)
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
-
-# ==============================================================================
-# GLOBAL IN-MEMORY STATE
-# ==============================================================================
-
-app_state = {
-    "model": None,
-    "labels": [],
-    "history": [],
-    "image_cache": {},   # Stores recent images for PDF generation
-    "report_cache": {},  # Stores generated PDF bytes
-    "stats": {
-        "total_predictions": 0,
-        "class_counts": {},
-        "average_confidence": 0.0,
-        "average_latency_ms": 0.0
-    }
-}
-
-# ==============================================================================
-# PYDANTIC MODELS
-# ==============================================================================
-
-class ReportRequest(BaseModel):
-    prediction_id: str
-    patient_name: str
-    patient_age: str
-    patient_gender: str
-    doctor_name: str
-
-# ==============================================================================
-# LIFESPAN & INITIALIZATION
-# ==============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Initializing NeuroScan AI Backend...")
-    try:
-        if os.path.exists(MODEL_PATH):
-            app_state["model"] = tf.keras.models.load_model(MODEL_PATH, compile=False)
-            logger.info("TensorFlow Model loaded successfully.")
-        else:
-            logger.warning(f"Model {MODEL_PATH} not found! Ensure it is in the root directory.")
-
-        if os.path.exists(LABELS_PATH):
-            with open(LABELS_PATH, "r") as f:
-                app_state["labels"] = [line.strip().split(" ", 1)[-1] for line in f if line.strip()]
-            for label in app_state["labels"]:
-                app_state["stats"]["class_counts"][label] = 0
-            logger.info(f"Labels loaded: {app_state['labels']}")
-        else:
-            logger.warning(f"Labels {LABELS_PATH} not found!")
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
-    yield
-    logger.info("Shutting down NeuroScan AI Backend...")
-    app_state["model"] = None
-    app_state["image_cache"].clear()
-    app_state["report_cache"].clear()
-
-app = FastAPI(
-    title="NeuroScan AI Medical API",
-    description="Enterprise API for COVID-19 Chest X-Ray inference and diagnostic report generation.",
-    version="2.0.0",
-    lifespan=lifespan
+MODEL_PATH = (
+    CONTAINER_DIR / "keras_model.h5"
+    if (CONTAINER_DIR / "keras_model.h5").exists()
+    else BASE_DIR / "keras_model.h5"
+)
+LABELS_PATH = (
+    CONTAINER_DIR / "labels.txt"
+    if (CONTAINER_DIR / "labels.txt").exists()
+    else BASE_DIR / "labels.txt"
 )
 
-app.add_middleware(
+REPORTS_DIR = Path("/tmp/neuroscan_reports")
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+APP_VERSION = "2.1.0"
+MAX_UPLOAD_SIZE_MB = 10
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+ALLOWED_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/bmp",
+    "image/webp",
+}
+
+# ---------------------------------------------------------------------------
+# Modal Configuration (Strictly Backend Only - Python 3.11 + TF 2.15 Keras 2)
+# ---------------------------------------------------------------------------
+modal_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "libgomp1",
+        "libgl1",
+        "libglib2.0-0",
+    )
+    .pip_install_from_requirements("requirements.txt")
+    .add_local_file("keras_model.h5", remote_path="/app/keras_model.h5", copy=True)
+    .add_local_file("labels.txt", remote_path="/app/labels.txt", copy=True)
+)
+
+app = modal.App("neuroscan-covid-xray")
+
+# ---------------------------------------------------------------------------
+# In-Memory Application State
+# ---------------------------------------------------------------------------
+ml_state: Dict[str, Any] = {
+    "model": None,
+    "labels": [],
+    "model_loaded": False,
+    "load_error": None,
+    "loaded_at": None,
+    "input_shape": (224, 224, 3),
+    "tf_version": None,
+}
+
+prediction_history: List[Dict[str, Any]] = []
+reports_registry: Dict[str, str] = {}
+startup_timestamp: float = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+def parse_labels_file(labels_path: Path) -> List[str]:
+    if not labels_path.exists():
+        logger.warning(f"Labels file not found at {labels_path}. Using defaults.")
+        return ["COVID-19", "Normal"]
+
+    cleaned_labels: List[str] = []
+    with open(labels_path, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            parts = raw.split(" ", 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                cleaned_labels.append(parts[1].strip())
+            else:
+                cleaned_labels.append(raw)
+    return cleaned_labels if cleaned_labels else ["COVID-19", "Normal"]
+
+
+def preprocess_xray_image(image_bytes: bytes, target_size=(224, 224)) -> np.ndarray:
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid or corrupted image file: {str(exc)}",
+        )
+
+    image = ImageOps.fit(image, target_size, Image.Resampling.LANCZOS)
+    image_array = np.asarray(image, dtype=np.float32)
+    normalized_image_array = (image_array / 127.5) - 1.0
+
+    data = np.ndarray(shape=(1, target_size[0], target_size[1], 3), dtype=np.float32)
+    data[0] = normalized_image_array
+    return data
+
+
+# ---------------------------------------------------------------------------
+# FastAPI Lifespan (Lazy TensorFlow Import inside Modal Container)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    if ml_state["model_loaded"] and ml_state["model"] is not None:
+        yield
+        return
+
+    logger.info("Initializing FastAPI lifespan: importing TensorFlow and loading model...")
+    try:
+        import tensorflow as tf
+
+        ml_state["tf_version"] = tf.__version__
+        logger.info(f"TensorFlow {tf.__version__} imported successfully.")
+
+        class CompatDepthwiseConv2D(tf.keras.layers.DepthwiseConv2D):
+            def __init__(self, *args, **kwargs):
+                kwargs.pop("groups", None)
+                super().__init__(*args, **kwargs)
+
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
+
+        logger.info(f"Loading Keras model from {MODEL_PATH}...")
+        model = tf.keras.models.load_model(
+            str(MODEL_PATH),
+            compile=False,
+            custom_objects={"DepthwiseConv2D": CompatDepthwiseConv2D},
+        )
+
+        try:
+            in_shape = model.input_shape
+            if isinstance(in_shape, tuple) and len(in_shape) == 4:
+                ml_state["input_shape"] = (
+                    in_shape[1] or 224,
+                    in_shape[2] or 224,
+                    in_shape[3] or 3,
+                )
+        except Exception:
+            ml_state["input_shape"] = (224, 224, 3)
+
+        labels = parse_labels_file(LABELS_PATH)
+
+        dummy_h, dummy_w, dummy_c = ml_state["input_shape"]
+        dummy_input = np.zeros((1, dummy_h, dummy_w, dummy_c), dtype=np.float32)
+        _ = model.predict(dummy_input, verbose=0)
+
+        ml_state["model"] = model
+        ml_state["labels"] = labels
+        ml_state["model_loaded"] = True
+        ml_state["load_error"] = None
+        ml_state["loaded_at"] = datetime.now(timezone.utc).isoformat()
+
+        logger.info(f"Model loaded and warmed up successfully. Classes: {labels}")
+
+    except Exception as exc:
+        logger.exception(f"Failed to load model during lifespan startup: {exc}")
+        ml_state["model_loaded"] = False
+        ml_state["load_error"] = str(exc)
+
+    yield
+
+    logger.info("Shutting down container...")
+    ml_state["model"] = None
+    ml_state["model_loaded"] = False
+
+
+# ---------------------------------------------------------------------------
+# FastAPI Application (`web_app`)
+# ---------------------------------------------------------------------------
+web_app = FastAPI(
+    title="NeuroScan COVID-19 Chest X-Ray Classification API",
+    description="Pure Backend API hosted on Modal for GitHub Pages Frontend.",
+    version=APP_VERSION,
+    lifespan=lifespan,
+)
+
+web_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = f"{process_time:.4f}"
-    return response
 
-# ==============================================================================
-# HELPER FUNCTIONS
-# ==============================================================================
-
-def update_statistics(prediction: str, confidence: float, latency: float):
-    stats = app_state["stats"]
-    t = stats["total_predictions"]
-    stats["average_confidence"] = ((stats["average_confidence"] * t) + confidence) / (t + 1)
-    stats["average_latency_ms"] = ((stats["average_latency_ms"] * t) + latency) / (t + 1)
-    stats["total_predictions"] += 1
-    stats["class_counts"][prediction] = stats["class_counts"].get(prediction, 0) + 1
-
-class MedicalReportPDF(FPDF):
-    def header(self):
-        self.set_font('Arial', 'B', 16)
-        self.set_text_color(29, 78, 216) # Blue
-        self.cell(0, 10, 'NEUROSCAN AI CLINICAL DIAGNOSTIC REPORT', 0, 1, 'C')
-        self.set_font('Arial', 'I', 10)
-        self.set_text_color(100, 116, 139)
-        self.cell(0, 5, 'Automated Chest Radiograph Analysis', 0, 1, 'C')
-        self.line(10, 28, 200, 28)
-        self.ln(10)
-
-    def footer(self):
-        self.set_y(-25)
-        self.set_font('Arial', 'I', 8)
-        self.set_text_color(128)
-        self.multi_cell(0, 4, "DISCLAIMER: This report is generated by an AI model for preliminary screening only. It does not replace a professional clinical diagnosis by a certified physician.", 0, 'C')
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
-
-def generate_pdf_report(req_data: dict, img_bytes: bytes) -> bytes:
-    pdf = MedicalReportPDF()
-    pdf.add_page()
-    
-    # Patient Info (Clean & Simple Layout)
-    pdf.set_font('Arial', 'B', 12)
-    pdf.set_text_color(15, 23, 42)
-    pdf.cell(100, 8, f"Patient Name: {req_data['patient_name']}", 0, 0)
-    pdf.cell(90, 8, f"Report ID: {req_data['prediction_id'][:8].upper()}", 0, 1, 'R')
-    pdf.set_font('Arial', '', 11)
-    pdf.cell(100, 6, f"Age / Gender: {req_data['patient_age']} / {req_data['patient_gender']}", 0, 0)
-    pdf.cell(90, 6, f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", 0, 1, 'R')
-    pdf.cell(100, 6, f"Referring Doctor: {req_data['doctor_name']}", 0, 1)
-    pdf.ln(5)
-
-    # Results Section
-    is_covid = "covid" in req_data['prediction'].lower()
-    color = (220, 38, 38) if is_covid else (16, 185, 129)
-    
-    pdf.set_font('Arial', 'B', 14)
-    pdf.set_fill_color(241, 245, 249)
-    pdf.cell(0, 10, ' AI INFERENCE RESULTS', 0, 1, 'L', 1)
-    pdf.ln(3)
-    
-    pdf.set_font('Arial', 'B', 12)
-    pdf.cell(50, 8, 'Primary Finding:', 0, 0)
-    pdf.set_text_color(*color)
-    pdf.cell(0, 8, req_data['prediction'].upper(), 0, 1)
-    
-    pdf.set_text_color(15, 23, 42)
-    pdf.cell(50, 8, 'Confidence Score:', 0, 0)
-    pdf.cell(0, 8, f"{req_data['confidence']}%", 0, 1)
-    
-    risk_level = "HIGH RISK" if is_covid else "LOW RISK"
-    pdf.cell(50, 8, 'Risk Level:', 0, 0)
-    pdf.set_text_color(*color)
-    pdf.cell(0, 8, risk_level, 0, 1)
-    
-    # Save Image to temp file and insert
-    pdf.ln(5)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_img:
-        tmp_img.write(img_bytes)
-        tmp_img_path = tmp_img.name
-    
-    pdf.image(tmp_img_path, x=10, w=80)
-    os.remove(tmp_img_path)
-
-    # Chart Generation (Keeping it clean)
-    probs = req_data['probabilities']
-    labels = list(probs.keys())
-    values = list(probs.values())
-    
-    plt.figure(figsize=(6, 4))
-    bars = plt.barh(labels, values, color=['#ef4444' if 'covid' in l.lower() else '#3b82f6' for l in labels])
-    plt.xlim(0, 100)
-    plt.title('Class Probabilities (%)')
-    plt.tight_layout()
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_chart:
-        plt.savefig(tmp_chart.name, format='png', dpi=150)
-        tmp_chart_path = tmp_chart.name
-    plt.close()
-    
-    pdf.image(tmp_chart_path, x=100, y=pdf.get_y()-80, w=100)
-    os.remove(tmp_chart_path)
-    
-    # Clinical Notes
-    pdf.set_y(150)
-    pdf.set_font('Arial', 'B', 12)
-    pdf.set_text_color(15, 23, 42)
-    pdf.cell(0, 10, ' CLINICAL OBSERVATIONS & RECOMMENDATIONS', 0, 1, 'L', 1)
-    pdf.set_font('Arial', '', 11)
-    pdf.ln(3)
-    
-    if is_covid:
-        obs = "The AI model detected patterns highly consistent with COVID-19."
-        rec = "Immediate clinical correlation required. Recommend RT-PCR confirmation and isolation protocols."
-    else:
-        obs = "The AI model did not detect significant radiological patterns consistent with COVID-19."
-        rec = "Routine clinical assessment advised. If patient is symptomatic, consider follow-up imaging."
-        
-    pdf.multi_cell(0, 6, f"Observation: {obs}")
-    pdf.ln(2)
-    pdf.multi_cell(0, 6, f"Recommendation: {rec}")
-
-    # Return as raw bytes
-    return bytes(pdf.output())
-
-# ==============================================================================
-# API ENDPOINTS
-# ==============================================================================
-
-@app.get("/")
-async def root():
-    return {"status": "Online", "service": "NeuroScan AI Engine"}
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "Healthy",
-        "model_loaded": app_state["model"] is not None,
-        "labels": len(app_state["labels"]),
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@app.get("/version")
-async def version():
-    return {"api_version": "2.0.0", "engine": f"TensorFlow {tf.__version__}"}
-
-@app.get("/model-info")
-async def model_info():
-    return {
-        "classes": app_state["labels"],
-        "input_shape": TARGET_SIZE,
-        "type": "Deep Convolutional Neural Network"
-    }
-
-@app.get("/statistics")
-async def get_stats():
-    return app_state["stats"]
-
-@app.get("/history")
-async def get_history():
-    return {"count": len(app_state["history"]), "data": app_state["history"][::-1]}
-
-@app.delete("/history")
-async def reset_history():
-    app_state["history"].clear()
-    app_state["image_cache"].clear()
-    app_state["report_cache"].clear()
-    return {"message": "System memory cleared."}
-
-@app.post("/predict")
-async def predict(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    start_time = time.time()
-    
-    if app_state["model"] is None:
-        raise HTTPException(status_code=503, detail="AI Engine Offline. Check if keras_model.h5 is loaded.")
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Invalid payload. Image required.")
-
-    try:
-        contents = await file.read()
-        if len(contents) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=413, detail="File exceeds 5MB limit.")
-
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        image = image.resize(TARGET_SIZE)
-        img_array = np.asarray(image, dtype=np.float32)
-        img_array = (img_array / 127.5) - 1.0
-        img_array = np.expand_dims(img_array, axis=0)
-
-        preds = app_state["model"].predict(img_array, verbose=0)[0]
-        
-        pred_idx = int(np.argmax(preds))
-        pred_class = app_state["labels"][pred_idx] if app_state["labels"] else f"Class {pred_idx}"
-        confidence = round(float(preds[pred_idx]) * 100, 2)
-
-        probs = {
-            (app_state["labels"][i] if app_state["labels"] else f"Class {i}"): round(float(p) * 100, 2)
-            for i, p in enumerate(preds)
-        }
-
-        latency = round((time.time() - start_time) * 1000, 2)
-        req_id = str(uuid.uuid4())
-
-        result = {
-            "id": req_id,
-            "filename": file.filename,
-            "prediction": pred_class,
-            "confidence": confidence,
-            "probabilities": probs,
-            "latency_ms": latency,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-        # Cache state for history and PDF generation
-        app_state["history"].append(result)
-        app_state["image_cache"][req_id] = contents
-        background_tasks.add_task(update_statistics, pred_class, confidence, latency)
-
-        return result
-
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Corrupted image file.")
-    except Exception as e:
-        logger.error(f"Inference error: {e}")
-        raise HTTPException(status_code=500, detail="Internal Neural Network Error.")
-
-@app.post("/generate-report")
-async def generate_report(req: ReportRequest):
-    req_id = req.prediction_id
-    
-    if req_id not in app_state["image_cache"]:
-        raise HTTPException(status_code=404, detail="Prediction ID expired or invalid.")
-        
-    # Find prediction data
-    pred_data = next((item for item in app_state["history"] if item["id"] == req_id), None)
-    if not pred_data:
-        raise HTTPException(status_code=404, detail="Prediction data not found.")
-
-    try:
-        report_data = {**pred_data, **req.dict()}
-        pdf_bytes = generate_pdf_report(report_data, app_state["image_cache"][req_id])
-        
-        report_id = f"REP-{str(uuid.uuid4())[:8].upper()}"
-        app_state["report_cache"][report_id] = pdf_bytes
-        
-        return {"report_id": report_id, "message": "Report generated successfully."}
-    except Exception as e:
-        logger.error(f"PDF Generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to compile PDF report: {str(e)}")
-
-@app.get("/download-report/{report_id}")
-async def download_report(report_id: str):
-    if report_id not in app_state["report_cache"]:
-        raise HTTPException(status_code=404, detail="Report not found or expired.")
-        
-    pdf_bytes = app_state["report_cache"][report_id]
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=NeuroScan_Report_{report_id}.pdf"}
+class ReportRequest(BaseModel):
+    prediction_id: Optional[str] = Field(default=None)
+    patient_name: Optional[str] = Field(default="Anonymous Patient")
+    patient_id: Optional[str] = Field(default="N/A")
+    patient_age: Optional[Any] = Field(default="N/A")
+    patient_gender: Optional[str] = Field(default="N/A")
+    doctor_name: Optional[str] = Field(default="Assigned Physician")
+    filename: Optional[str] = Field(default="xray_scan.png")
+    prediction: Optional[str] = Field(default=None)
+    predicted_class: Optional[str] = Field(default=None)
+    confidence: Optional[float] = Field(default=0.0)
+    probabilities: Optional[Dict[str, float]] = Field(default_factory=dict)
+    notes: Optional[str] = Field(
+        default="AI-assisted screening result. Correlate clinically with RT-PCR and radiologist review."
     )
+
+
+def compute_statistics() -> Dict[str, Any]:
+    total = len(prediction_history)
+    if total == 0:
+        class_counts = {label: 0 for label in ml_state["labels"]}
+        return {
+            "total_predictions": 0,
+            "covid_detected": 0,
+            "normal_detected": 0,
+            "other_detected": 0,
+            "class_distribution": class_counts,
+            "average_confidence": 0.0,
+            "average_latency_ms": 0.0,
+            "average_inference_time_ms": 0.0,
+            "last_prediction_at": None,
+            "persistence_note": "In-memory container storage (resets on container restart).",
+        }
+
+    class_counts: Dict[str, int] = {label: 0 for label in ml_state["labels"]}
+    covid_count = 0
+    normal_count = 0
+    other_count = 0
+    confidences: List[float] = []
+    inference_times: List[float] = []
+
+    for item in prediction_history:
+        pred_label = item.get("prediction", "Unknown")
+        class_counts[pred_label] = class_counts.get(pred_label, 0) + 1
+
+        lower_label = pred_label.lower()
+        if "covid" in lower_label:
+            covid_count += 1
+        elif "normal" in lower_label:
+            normal_count += 1
+        else:
+            other_count += 1
+
+        conf = float(item.get("confidence", 0.0))
+        conf_pct = conf * 100.0 if conf <= 1.0 else conf
+        confidences.append(conf_pct)
+        inference_times.append(float(item.get("latency_ms", item.get("inference_time_ms", 0.0))))
+
+    avg_lat = round(sum(inference_times) / total, 2)
+    return {
+        "total_predictions": total,
+        "covid_detected": covid_count,
+        "normal_detected": normal_count,
+        "other_detected": other_count,
+        "class_distribution": class_counts,
+        "average_confidence": round(sum(confidences) / total, 2),
+        "average_latency_ms": avg_lat,
+        "average_inference_time_ms": avg_lat,
+        "last_prediction_at": prediction_history[0].get("timestamp"),
+        "persistence_note": "In-memory container storage (resets on container scale-down/restart).",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pure JSON API Endpoints
+# ---------------------------------------------------------------------------
+@web_app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "NeuroScan COVID-19 Chest X-Ray Classification API (Backend Only)",
+        "version": APP_VERSION,
+        "model_loaded": ml_state["model_loaded"],
+        "classes": ml_state["labels"],
+        "endpoints": [
+            "GET /",
+            "GET /health",
+            "GET /version",
+            "GET /model-info",
+            "GET /statistics",
+            "GET /history",
+            "DELETE /history",
+            "POST /predict",
+            "POST /generate-report",
+            "GET /download-report/{report_id}",
+        ],
+    }
+
+
+@web_app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy" if ml_state["model_loaded"] else "degraded",
+        "model_loaded": ml_state["model_loaded"],
+        "load_error": ml_state["load_error"],
+        "uptime_seconds": round(time.time() - startup_timestamp, 2),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@web_app.get("/version")
+async def get_version():
+    import platform
+
+    return {
+        "api_version": APP_VERSION,
+        "python_version": platform.python_version(),
+        "tensorflow_version": ml_state["tf_version"] or "Not loaded yet",
+        "framework": "FastAPI + TensorFlow/Keras on Modal",
+    }
+
+
+@web_app.get("/model-info")
+async def get_model_info():
+    model = ml_state["model"]
+    return {
+        "model_name": "COVID-19 Chest X-Ray Classifier (Keras .h5)",
+        "model_file": MODEL_PATH.name,
+        "model_loaded": ml_state["model_loaded"],
+        "loaded_at": ml_state["loaded_at"],
+        "input_shape": list(ml_state["input_shape"]),
+        "classes": ml_state["labels"],
+        "num_classes": len(ml_state["labels"]),
+        "total_parameters": int(model.count_params()) if model is not None else None,
+        "total_layers": len(model.layers) if model is not None else None,
+        "tensorflow_version": ml_state["tf_version"],
+    }
+
+
+@web_app.get("/statistics")
+async def get_statistics():
+    return compute_statistics()
+
+
+@web_app.get("/history")
+async def get_history(limit: int = 50):
+    sliced = prediction_history[: max(1, min(limit, 200))]
+    return {
+        "count": len(sliced),
+        "total": len(prediction_history),
+        "history": sliced,
+    }
+
+
+@web_app.delete("/history")
+async def clear_history():
+    cleared_count = len(prediction_history)
+    prediction_history.clear()
+    return {
+        "status": "success",
+        "message": f"Cleared {cleared_count} prediction record(s) from history.",
+        "cleared_count": cleared_count,
+    }
+
+
+@web_app.post("/predict")
+async def predict_xray(file: UploadFile = File(...)):
+    if not ml_state["model_loaded"] or ml_state["model"] is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model not loaded: {ml_state['load_error']}",
+        )
+
+    filename = file.filename or "uploaded_xray.png"
+    ext = Path(filename).suffix.lower()
+    content_type = (file.content_type or "").lower()
+
+    if ext and ext not in ALLOWED_EXTENSIONS and content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext or content_type}'. Allowed: JPG, JPEG, PNG, BMP, WEBP.",
+        )
+
+    image_bytes = await file.read()
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    if len(image_bytes) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds maximum allowed size of {MAX_UPLOAD_SIZE_MB} MB.",
+        )
+
+    target_h, target_w, _ = ml_state["input_shape"]
+    input_tensor = preprocess_xray_image(image_bytes, target_size=(target_h, target_w))
+
+    start_t = time.perf_counter()
+    raw_preds = ml_state["model"].predict(input_tensor, verbose=0)
+    inference_ms = round((time.perf_counter() - start_t) * 1000.0, 2)
+
+    probs = raw_preds[0].tolist()
+    labels = ml_state["labels"]
+
+    probabilities_raw_dict: Dict[str, float] = {}
+    probabilities_percent_dict: Dict[str, float] = {}
+    all_predictions_list: List[Dict[str, Any]] = []
+
+    for idx, score in enumerate(probs):
+        label_name = labels[idx] if idx < len(labels) else f"Class_{idx}"
+        score_float = float(score)
+        probabilities_raw_dict[label_name] = round(score_float, 6)
+        probabilities_percent_dict[label_name] = round(score_float * 100.0, 2)
+        all_predictions_list.append(
+            {
+                "class": label_name,
+                "label": label_name,
+                "confidence": round(score_float, 6),
+                "percentage": round(score_float * 100.0, 2),
+            }
+        )
+
+    best_idx = int(np.argmax(probs))
+    best_label = labels[best_idx] if best_idx < len(labels) else f"Class_{best_idx}"
+    best_conf = float(probs[best_idx])
+    best_conf_pct = round(best_conf * 100.0, 2)
+
+    prediction_id = str(uuid.uuid4())
+    timestamp_iso = datetime.now(timezone.utc).isoformat()
+
+    is_covid = "covid" in best_label.lower()
+    risk_level = (
+        "High"
+        if (is_covid and best_conf >= 0.7)
+        else ("Moderate" if is_covid else "Low")
+    )
+
+    record = {
+        "id": prediction_id,
+        "prediction_id": prediction_id,
+        "filename": filename,
+        "prediction": best_label,
+        "predicted_class": best_label,
+        "class_index": best_idx,
+        "confidence": best_conf_pct,
+        "confidence_raw": round(best_conf, 6),
+        "confidence_percentage": best_conf_pct,
+        "probabilities": probabilities_percent_dict,
+        "probabilities_raw": probabilities_raw_dict,
+        "predictions": all_predictions_list,
+        "risk_level": risk_level,
+        "latency_ms": inference_ms,
+        "inference_time_ms": inference_ms,
+        "file_size_bytes": len(image_bytes),
+        "timestamp": timestamp_iso,
+    }
+
+    prediction_history.insert(0, record)
+    if len(prediction_history) > 500:
+        prediction_history.pop()
+
+    return record
+
+
+@web_app.post("/generate-report")
+async def generate_pdf_report(payload: ReportRequest):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    matched_record: Optional[Dict[str, Any]] = None
+    if payload.prediction_id:
+        for item in prediction_history:
+            if item.get("id") == payload.prediction_id or item.get("prediction_id") == payload.prediction_id:
+                matched_record = item
+                break
+
+    pred_label = (
+        payload.prediction
+        or payload.predicted_class
+        or (matched_record.get("prediction") if matched_record else None)
+        or (prediction_history[0].get("prediction") if prediction_history else "Unknown")
+    )
+
+    raw_conf = (
+        payload.confidence
+        if payload.confidence and payload.confidence > 0
+        else (matched_record.get("confidence", 0.0) if matched_record else 0.0)
+    )
+    conf_pct = round(raw_conf * 100.0, 2) if raw_conf <= 1.0 else round(raw_conf, 2)
+
+    probs_map = (
+        payload.probabilities
+        if payload.probabilities
+        else (matched_record.get("probabilities", {}) if matched_record else {})
+    )
+    scan_filename = (
+        payload.filename
+        if payload.filename != "xray_scan.png"
+        else (matched_record.get("filename", "xray_scan.png") if matched_record else "xray_scan.png")
+    )
+
+    report_id = str(uuid.uuid4())
+    pdf_filename = f"NeuroScan_Report_{report_id[:8]}.pdf"
+    pdf_path = REPORTS_DIR / pdf_filename
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        rightMargin=0.75 * inch,
+        leftMargin=0.75 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Heading1"],
+        fontSize=18,
+        textColor=colors.HexColor("#0f172a"),
+        spaceAfter=12,
+    )
+    section_style = ParagraphStyle(
+        "SectionHeader",
+        parent=styles["Heading2"],
+        fontSize=13,
+        textColor=colors.HexColor("#1e3a8a"),
+        spaceBefore=14,
+        spaceAfter=8,
+    )
+    normal_style = styles["BodyText"]
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    elements = [
+        Paragraph("NeuroScan AI - Chest X-Ray Diagnostic Report", title_style),
+        Paragraph(f"<b>Report ID:</b> {report_id}", normal_style),
+        Paragraph(f"<b>Generated At:</b> {now_str}", normal_style),
+        Spacer(1, 14),
+        Paragraph("1. Patient & Scan Information", section_style),
+    ]
+
+    patient_data = [
+        ["Patient Name", str(payload.patient_name or "Anonymous Patient")],
+        ["Age / Gender", f"{payload.patient_age or 'N/A'} / {payload.patient_gender or 'N/A'}"],
+        ["Attending Physician", str(payload.doctor_name or "Assigned Physician")],
+        ["Source Image File", str(scan_filename)],
+    ]
+    patient_table = Table(patient_data, colWidths=[2.2 * inch, 4.3 * inch])
+    patient_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f1f5f9")),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ]
+        )
+    )
+    elements.append(patient_table)
+
+    elements.append(Paragraph("2. AI Classification Summary", section_style))
+    result_data = [
+        ["Predicted Classification", str(pred_label)],
+        ["Confidence Score", f"{conf_pct:.2f}%"],
+        ["Model Architecture", "Keras Deep CNN (224x224x3)"],
+    ]
+    for cls_name, cls_prob in probs_map.items():
+        val = cls_prob * 100.0 if cls_prob <= 1.0 else cls_prob
+        result_data.append([f"Probability ({cls_name})", f"{val:.2f}%"])
+
+    result_table = Table(result_data, colWidths=[2.2 * inch, 4.3 * inch])
+    result_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eff6ff")),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#93c5fd")),
+            ]
+        )
+    )
+    elements.append(result_table)
+
+    elements.append(Paragraph("3. Clinical Notes & Medical Disclaimer", section_style))
+    elements.append(Paragraph(payload.notes or "", normal_style))
+    elements.append(Spacer(1, 10))
+    elements.append(
+        Paragraph(
+            "<b>Disclaimer:</b> This report is generated by an automated deep learning model for "
+            "research and decision-support purposes only. Always consult a qualified radiologist.",
+            normal_style,
+        )
+    )
+
+    doc.build(elements)
+    reports_registry[report_id] = str(pdf_path)
+
+    return {
+        "status": "success",
+        "report_id": report_id,
+        "filename": pdf_filename,
+        "download_url": f"/download-report/{report_id}",
+        "generated_at": now_str,
+    }
+
+
+@web_app.get("/download-report/{report_id}")
+async def download_report(report_id: str):
+    pdf_path_str = reports_registry.get(report_id)
+    if not pdf_path_str:
+        candidate = REPORTS_DIR / f"NeuroScan_Report_{report_id[:8]}.pdf"
+        if candidate.exists():
+            pdf_path_str = str(candidate)
+
+    if not pdf_path_str or not Path(pdf_path_str).exists():
+        raise HTTPException(status_code=404, detail="Report not found or expired.")
+
+    return FileResponse(
+        path=pdf_path_str,
+        media_type="application/pdf",
+        filename=Path(pdf_path_str).name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Modal ASGI Entrypoint
+# ---------------------------------------------------------------------------
+@app.function(
+    image=modal_image,
+    cpu=2.0,
+    memory=4096,
+    timeout=300,
+    scaledown_window=300,
+)
+@modal.concurrent(max_inputs=15)
+@modal.asgi_app()
+def fastapi_app():
+    return web_app
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:web_app", host="0.0.0.0", port=8000, reload=True)
